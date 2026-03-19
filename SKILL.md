@@ -1,6 +1,6 @@
 ---
 name: kimi-deep-search
-description: Deep research via Kimi CLI. Triggers - "deep search", "详细搜索", "深度研究", "帮我查一下", "综合分析", "调研", "研究报告"
+description: Deep research via Kimi CLI. Triggers - "Kimi 搜一下", "Kimi研究一下", "Kimi deep research"
 ---
 
 # Kimi Deep Search
@@ -16,7 +16,7 @@ description: Deep research via Kimi CLI. Triggers - "deep search", "详细搜索
 - ✅ **智能缓存** — 24 小时内相同查询直接返回缓存结果
 - ✅ **Token 追踪** — 估算输入/输出 token 使用量 (1 token ≈ 3 字符)
 - ✅ **自动重试** — 超时或服务错误时自动重试 (最多3次，指数退避)
-- ✅ **自动发送** — 完成后自动发送报告到 Telegram 对话
+- ✅ **自动发送** — agent 完成后自动发送报告到当前对话（支持所有 channel）
 - ✅ **进度通知** — 可选实时进度更新
 
 ## 对比 Codex Deep Search
@@ -36,40 +36,41 @@ description: Deep research via Kimi CLI. Triggers - "deep search", "详细搜索
 
 - Kimi CLI 已安装: `kimi --version`
 - 已登录: `kimi login`
-- OpenClaw 已配置 Telegram (用于自动发送)
 
 ## Usage
 
-### 方式 1: 直接执行脚本
+Agent 执行流程：
+
+1. 用 `exec` 运行 `search.sh`（仅生成报告文件）
+2. 脚本完成后，读取 meta JSON 获取统计信息
+3. 用 `message` 工具发送摘要 + 文件到当前会话（自动路由到正确的 channel）
+
+### 基本执行
 
 ```bash
 bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh \
   --prompt "NVIDIA Rubin Ultra 供应链分析" \
   --task-name "nvidia-research" \
-  --timeout 180 \
-  --send-to-chat \
-  --chat-id "-1001234567890"
+  --timeout 180
 ```
 
-### 方式 2: 后台执行 (推荐长查询)
+### 后台执行 (推荐长查询)
 
 ```bash
 nohup bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh \
   --prompt "你的研究主题" \
   --task-name "research-$(date +%s)" \
-  --timeout 300 \
-  --telegram-group "-1001234567890" > /tmp/kimi-search.log 2>&1 &
-echo "搜索已启动，完成后会自动发送结果"
+  --timeout 300 > /tmp/kimi-search.log 2>&1 &
+echo "搜索已启动"
 ```
 
-### 方式 3: 快捷命令
+### 发送结果到当前会话
 
-```bash
-# 添加到 ~/.bashrc
-alias kimi-search='bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh'
+脚本完成后，agent 读取报告并用 message 工具发送：
 
-# 使用
-kimi-search --prompt "特斯拉最新财报" --send-to-chat
+```
+读取 <output>.md 的 Executive Summary 部分，提取关键结论。
+用 message 工具发送摘要文本，然后用 MEDIA: 指令发送完整报告文件。
 ```
 
 ## Parameters
@@ -81,9 +82,6 @@ kimi-search --prompt "特斯拉最新财报" --send-to-chat
 | `--task-name` | ❌ | `kimi-search-<timestamp>` | 任务标识 |
 | `--timeout` | ❌ | `180` | 超时秒数 |
 | `--model` | ❌ | `kimi-code/kimi-for-coding` | Kimi 模型 |
-| `--telegram-group` | ❌ | — | Telegram 群组 ID (用于通知) |
-| `--chat-id` | ❌ | — | 发送报告的聊天 ID |
-| `--send-to-chat` | ❌ | `false` | 完成后自动发送报告 |
 | `--verbose` | ❌ | `false` | 详细输出 |
 | `--max-retries` | ❌ | `3` | 失败时最大重试次数 |
 
@@ -155,15 +153,13 @@ bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh \
   --timeout 60
 ```
 
-### 例 2: 深度研究 + 自动发送
+### 例 2: 深度研究
 
 ```bash
 bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh \
   --prompt "英伟达Rubin Ultra架构中PCB供应商竞争格局分析" \
   --task-name "rubin-pcb-research" \
-  --timeout 240 \
-  --send-to-chat \
-  --chat-id "-1001234567890"
+  --timeout 240
 ```
 
 ### 例 3: 后台执行 (适合长查询)
@@ -172,7 +168,6 @@ bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh \
 nohup bash ~/.openclaw/workspace/skills/kimi-deep-search/scripts/search.sh \
   --prompt "2025年AI芯片市场格局深度分析" \
   --task-name "ai-chip-2025" \
-  --telegram-group "-1001234567890" \
   --timeout 300 > /tmp/ai-chip.log 2>&1 &
 echo "任务已后台启动"
 ```
@@ -189,9 +184,9 @@ kimi login
 - 检查 `--timeout` 是否足够 (复杂查询建议 180s+)
 - 查看 raw 文件: `cat data/kimi-search-results/*-raw.txt`
 
-### 没有收到 Telegram 消息
-- 确认 `--chat-id` 或 `--telegram-group` 正确
-- 确认 OpenClaw Telegram 配置正常: `openclaw message send --help`
+### 没有收到结果消息
+- 脚本不再自动发送消息，结果由 agent 通过 `message` 工具发送到当前会话
+- 确认脚本正常完成并生成了报告文件
 
 ### Token 使用量过高
 - 缩短查询长度

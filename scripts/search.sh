@@ -3,10 +3,12 @@
 # Features: JSON escaping, stdin-based prompt, retry logic, token tracking
 set -euo pipefail
 
+# Load environment from bashrc (for non-interactive shells)
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+
 SKILL_DIR="${HOME}/.openclaw/workspace/skills/kimi-deep-search"
 RESULT_DIR="${SKILL_DIR}/data/kimi-search-results"
 CACHE_DIR="${SKILL_DIR}/data/cache"
-OPENCLAW_BIN="${HOME}/.npm-global/bin/openclaw"
 KIMI_BIN="${KIMI_BIN:-$(which kimi 2>/dev/null || echo "kimi")}"
 
 # Parameters
@@ -14,12 +16,8 @@ PROMPT=""
 OUTPUT=""
 MODEL="kimi-code/kimi-for-coding"
 TIMEOUT=180
-TELEGRAM_GROUP=""
 TASK_NAME="kimi-search-$(date +%s)"
 VERBOSE=false
-RESUME=false
-SEND_TO_CHAT=false
-CHAT_ID=""
 MAX_RETRIES=3
 
 # Parse arguments
@@ -29,12 +27,8 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT="$2"; shift 2;;
     --model) MODEL="$2"; shift 2;;
     --timeout) TIMEOUT="$2"; shift 2;;
-    --telegram-group) TELEGRAM_GROUP="$2"; shift 2;;
     --task-name) TASK_NAME="$2"; shift 2;;
     --verbose) VERBOSE=true; shift;;
-    --resume) RESUME=true; shift;;
-    --send-to-chat) SEND_TO_CHAT=true; shift;;
-    --chat-id) CHAT_ID="$2"; shift 2;;
     --max-retries) MAX_RETRIES="$2"; shift 2;;
     *) echo "Unknown flag: $1"; exit 1;;
   esac
@@ -42,7 +36,6 @@ done
 
 [[ -z "$PROMPT" ]] && { echo "ERROR: --prompt required"; exit 1; }
 [[ -z "$OUTPUT" ]] && OUTPUT="${RESULT_DIR}/${TASK_NAME}.md"
-[[ -z "$CHAT_ID" && "$SEND_TO_CHAT" == true ]] && CHAT_ID="${TELEGRAM_GROUP}"
 
 mkdir -p "$RESULT_DIR" "$CACHE_DIR" "$(dirname "$OUTPUT")"
 
@@ -236,7 +229,7 @@ PROMPT_CHAR_COUNT=${#PROMPT}
 INPUT_TOKENS=$(( PROMPT_CHAR_COUNT / 3 ))  # Rough estimate
 
 # Export variables for Python
-export TASK_NAME PROMPT MODEL ELAPSED EXIT_CODE OUTPUT RAW_OUTPUT META_FILE INPUT_TOKENS
+export TASK_NAME PROMPT MODEL ELAPSED EXIT_CODE OUTPUT RAW_OUTPUT META_FILE INPUT_TOKENS STARTED_AT RETRY_COUNT
 
 python3 << 'PYEOF'
 import re
@@ -256,46 +249,44 @@ META_FILE = os.environ.get('META_FILE', 'meta.json')
 INPUT_TOKENS = int(os.environ.get('INPUT_TOKENS', '0'))
 
 def extract_report(content):
-    """Extract clean report from Kimi output."""
-    lines = content.split('\n')
-    
-    # Skip metadata lines
-    skip_patterns = [
-        'TurnBegin(', 'StepBegin(', 'ThinkPart(', 'ToolCall(',
-        'ToolResult(', 'StatusUpdate(', 'FunctionBody(', 'ToolReturnValue(',
-        "type='think'", "type='function'", "type='tool_use_progress'",
-        'tool_call_id=', 'return_value=', 'is_error=', 
-        'encrypted=', 'extras=', 'message=',
-        'Welcome to Kimi Code CLI!',
-        'Send /help for help information.',
-        'Directory:',
-        'Session:',
-        'Model:',
-        'Tip:',
-    ]
-    
-    result = []
-    in_report = False
-    
-    for line in lines:
-        stripped = line.strip()
-        
-        # Skip empty lines at start
-        if not in_report and not stripped:
-            continue
-            
-        # Skip metadata patterns
-        if any(p in stripped for p in skip_patterns):
-            continue
-        
-        # Start of actual report
-        if stripped.startswith('#') and not in_report:
-            in_report = True
-        
-        if in_report:
-            result.append(line)
-    
-    return '\n'.join(result).strip()
+    """Extract clean report from Kimi output.
+
+    The actual report is inside a TextPart block near the end of output.
+    We find the last TextPart that contains a markdown heading.
+    """
+    # Match TextPart blocks specifically
+    text_part_pattern = re.compile(
+        r"TextPart\(\s*\n\s*type='text',\s*\n\s*text='(.*?)'\s*\n\)",
+        re.DOTALL
+    )
+    parts = list(text_part_pattern.finditer(content))
+
+    # Find the last part with a markdown heading (that's the final report)
+    report_text = None
+    for part in reversed(parts):
+        text = part.group(1)
+        text = text.replace('\\n', '\n')
+        text = text.replace('\\"', '"')
+        if re.search(r'^#+ ', text, re.MULTILINE):
+            report_text = text
+            break
+
+    if report_text:
+        # Find where the first heading is and start from there
+        heading_match = re.search(r'^#+ ', report_text, re.MULTILINE)
+        if heading_match:
+            report_text = report_text[heading_match.start():]
+        return report_text.strip()
+
+    # Fallback: search for the last occurrence of a report heading in raw content
+    content_unescaped = content.replace('\\n', '\n')
+    # Find all '# ...\n' occurrences that look like report headings
+    matches = list(re.finditer(r'^# [^\n]+报告', content_unescaped, re.MULTILINE))
+    if matches:
+        last_match = matches[-1]
+        return content_unescaped[last_match.start():].strip()
+
+    return content
 
 def clean_markdown(text):
     """Clean up markdown formatting."""
@@ -385,60 +376,41 @@ OUTPUT_TOKENS=$(( FILE_SIZE / 3 ))
 
 echo "[kimi-deep-search] Token estimate - Input: ~${INPUT_TOKENS}, Output: ~${OUTPUT_TOKENS}"
 
+TOTAL_TOKENS=$(( INPUT_TOKENS + OUTPUT_TOKENS ))
+
+# Export all variables needed by Python
+export LINES FILE_SIZE COMPLETED_AT INPUT_TOKENS OUTPUT_TOKENS TOTAL_TOKENS META_FILE
+
 python3 << PYMETA
 import json
+import os
 
 meta = {
-    "task_name": "${TASK_NAME}",
-    "prompt": """${PROMPT}""",
-    "output": "${OUTPUT}",
-    "started_at": "${STARTED_AT}",
-    "completed_at": "${COMPLETED_AT}",
-    "elapsed_seconds": ${ELAPSED},
-    "status": "completed" if ${EXIT_CODE} == 0 else "timeout",
-    "retries": ${RETRY_COUNT},
-    "lines": ${LINES},
-    "bytes": ${FILE_SIZE},
-    "exit_code": ${EXIT_CODE},
+    "task_name": os.environ.get('TASK_NAME', ''),
+    "prompt": os.environ.get('PROMPT', ''),
+    "output": os.environ.get('OUTPUT', ''),
+    "started_at": os.environ.get('STARTED_AT', ''),
+    "completed_at": os.environ.get('COMPLETED_AT', ''),
+    "elapsed_seconds": int(os.environ.get('ELAPSED', 0)),
+    "status": "completed" if os.environ.get('EXIT_CODE') == "0" else "timeout",
+    "retries": int(os.environ.get('RETRY_COUNT', 0)),
+    "lines": int(os.environ.get('LINES', 0)),
+    "bytes": int(os.environ.get('FILE_SIZE', 0)),
+    "exit_code": int(os.environ.get('EXIT_CODE', 0)),
     "tokens": {
-        "input": ${INPUT_TOKENS},
-        "output": ${OUTPUT_TOKENS},
-        "total": ${INPUT_TOKENS + OUTPUT_TOKENS},
+        "input": int(os.environ.get('INPUT_TOKENS', 0)),
+        "output": int(os.environ.get('OUTPUT_TOKENS', 0)),
+        "total": int(os.environ.get('TOTAL_TOKENS', 0)),
         "note": "estimated (1 token ≈ 3 chars)"
     }
 }
 
-with open('${META_FILE}', 'w', encoding='utf-8') as f:
+with open(os.environ.get('META_FILE', 'meta.json'), 'w', encoding='utf-8') as f:
     json.dump(meta, f, ensure_ascii=False, indent=2)
 PYMETA
 
 # Save to cache
 cp "$META_FILE" "$CACHE_FILE"
-
-# Send to chat if requested
-if [[ "$SEND_TO_CHAT" == true && -n "$CHAT_ID" && -x "$OPENCLAW_BIN" ]]; then
-  echo "[kimi-deep-search] Sending report to chat..."
-  
-  # Extract summary for message
-  SUMMARY=$(grep -A 10 "# Executive Summary" "$OUTPUT" 2>/dev/null | head -8 | grep -v "^#" || echo "Report completed")
-
-  # Send text summary with token info
-  "$OPENCLAW_BIN" message send --channel telegram --target "$CHAT_ID" \
-    --message "✅ **深度搜索完成: ${TASK_NAME}**
-
-🔍 ${PROMPT:0:60}...
-⏱ ${ELAPSED}s | 📄 ${LINES} 行 | 🔄 ${RETRY_COUNT} 次重试
-🪙 Token: ~${INPUT_TOKENS} in / ~${OUTPUT_TOKENS} out
-
-📝 摘要:
-${SUMMARY:0:400}...
-
-📎 完整报告见附件" 2>/dev/null || true
-  
-  # Send file
-  "$OPENCLAW_BIN" message send --channel telegram --target "$CHAT_ID" \
-    --filePath "$OUTPUT" 2>/dev/null || true
-fi
 
 echo "[kimi-deep-search] Done! Output: $OUTPUT"
 exit $EXIT_CODE
